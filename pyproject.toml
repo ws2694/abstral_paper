@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "abstral"
+version = "0.1.0"
+description = "ABSTRAL: Automated Agent System Design via a Skill-Referenced Three-Layer Adaptive Loop"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "langchain-openai>=0.2",
+    "langchain-anthropic>=0.3",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "prefect>=3.0",
+    "mlflow>=2.17",
+    "instructor>=1.5",
+    "pydantic>=2.9",
+    "gitpython>=3.1",
+    "polars>=1.0",
+    "networkx>=3.3",
+    "anthropic>=0.40",
+    "openai>=1.50",
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "rich>=13.9",
+    "streamlit>=1.40",
+    "plotly>=5.24",
+    "scipy>=1.14",
+    "numpy>=1.26",
+    "docker>=7.1",
+    "umap-learn>=0.5",
+]
+
+[project.scripts]
+abstral = "abstral.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["abstral"]

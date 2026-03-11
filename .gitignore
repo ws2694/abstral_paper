@@ -1,0 +1,40 @@
+# Secrets
+.env
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+missfont.log
+
+# Bundled LaTeX packages (standard, not project-specific)
+enumitem.sty
+wrapfig.sty
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE / Claude config
+.claude/
+
+# Old/superseded paper versions
+ABSTRAL_Paper_Final.*
+ABSTRAL_Methodology_Paper.pdf
+
+# Internal review notes
+ABSTRAL_Paper_Suggestions.md
+ABSTRAL_System_Design.jsx
+
+# Debug logs and old results
+results/logs/
+results/full_run.log
+results/pre_fix_v1/
+results/old_gpt4omini/
+results/otel_verify/
+results/sop/
+results/ABSTRAL_Paper_v3_revised.md
