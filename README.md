@@ -55,62 +55,6 @@ python run_sop.py --domain healthcare --main
 python run_sop.py --tables
 ```
 
-### Unit tests
-
-```bash
-pytest tests/test_core.py -v
-python smoketest.py
-```
-
-## How It Works
-
-ABSTRAL operates through three nested loops:
-
-### Layer 1 — Inner Trace-Referenced Loop (§3.2)
-
-Each iteration executes four phases on a batch of tasks:
-
-1. **BUILD**: A meta-agent (Claude Sonnet) reads the current SKILL.md and produces an `AgentSpec` — topology family, agent roles, edges, and entry point. This spec is compiled into a LangGraph.
-2. **RUN**: The compiled graph executes on a task batch under sandbox constraints (50K token budget, 5-min wall clock per task). Each agent node uses GPT-4o as its backbone.
-3. **ANALYZE**: Failed and succeeded traces are paired contrastively and classified into five Evidence Classes:
-   - **EC1** (Reasoning Error) → update K (domain knowledge)
-   - **EC2** (Topology Failure) → update R (topology rules)
-   - **EC3** (Missing Specialization) → update T (new specialist role via causal inference)
-   - **EC4** (Interface Failure) → update P (message schemas)
-   - **EC5** (Emergent Pattern) → update T (encode heuristic)
-4. **UPDATE**: Targeted edits to the corresponding SKILL.md section, committed via GitPython with trace ID citations.
-
-### Layer 2 — Convergence Detection (§3.3)
-
-Four independent signals determine when the inner loop should stop:
-
-| Signal | Condition | Weight |
-|--------|-----------|--------|
-| C1 (Skill Diff Collapse) | diff_lines < 5 | 2 |
-| C2 (AUC Plateau) | \|AUC_t - AUC_{t-1}\| < 0.005 for 3 consecutive iterations | 2 |
-| C3 (EC Signal Collapse) | (EC1 + EC2) / total < 10% | 1 |
-| C4 (Complexity Penalty) | rules > 200 or words > 5000 → triggers compaction | 1 |
-
-Termination fires when total weight >= 3.
-
-### Layer 3 — Diversity Seeding (§3.4)
-
-Each outer iteration seeds a new SKILL.md targeting the least-explored topology family, subject to dual-criteria repulsion:
-- **Structural**: GED >= 3 from all prior converged topologies
-- **Semantic**: Cosine distance >= 0.25 between role-set embeddings
-
-Six canonical families: `single`, `pipeline`, `ensemble`, `debate`, `hierarchical`, `dynamic_routing`.
-
-## Key Design Decisions
-
-**SKILL.md as central artifact.** All design knowledge lives in a single Markdown document with four sections (K/R/T/P). Every edit is committed with trace citations, creating a full audit trail.
-
-**No LLM-as-judge.** τ-bench uses DB-state SHA-256 hash comparison. SOPBench uses oracle-based 5-boolean criteria. GAIA uses exact-match accuracy.
-
-**Topology-aware step budgets.** Each topology family gets a step budget calibrated to its coordination pattern: pipelines get n+2, hierarchical gets 2n, debate gets 3n (floored at 8).
-
-**Conditional entry points.** For multi-turn benchmarks (τ-bench), the graph resumes at the last active tool agent rather than re-routing from the entry point every turn.
-
 ## Results
 
 Results are saved to `results/` as JSON files:
