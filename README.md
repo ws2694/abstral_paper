@@ -1,6 +1,6 @@
 # ABSTRAL: Automated Multi-Agent System Design via Skill-Referenced Adaptive Search
 
-This repository contains the full implementation and experiment code for the ABSTRAL framework, submitted to COLM 2026.
+This repository contains the full implementation and experiment code for the ABSTRAL framework.
 
 ABSTRAL treats multi-agent system (MAS) architecture as an evolving natural-language artifact — a **SKILL.md** document — refined through causal inference over execution traces, rather than scalar fitness optimization.
 
