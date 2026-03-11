@@ -4,48 +4,6 @@ This repository contains the full implementation and experiment code for the ABS
 
 ABSTRAL treats multi-agent system (MAS) architecture as an evolving natural-language artifact — a **SKILL.md** document — refined through causal inference over execution traces, rather than scalar fitness optimization.
 
-## Repository Structure
-
-```
-abstral/                        # Core framework package
-├── config.py                   # ABSTRALConfig, TopologyFamily, EvidenceClass enums
-├── models.py                   # TaskInstance, RunResult, BatchRunResult
-├── pipeline.py                 # End-to-end pipeline orchestrator (PipelineState)
-├── layer1/                     # Layer 1: Inner Trace-Referenced Loop
-│   ├── builder.py              #   BUILD: SKILL.md → AgentSpec → LangGraph
-│   ├── runner.py               #   RUN: Execute agent graph on task batch
-│   ├── analyzer.py             #   ANALYZE: Contrastive trace analysis → EC1–EC5
-│   └── updater.py              #   UPDATE: EC-driven targeted edits to SKILL.md
-├── layer2/                     # Layer 2: Convergence Detection
-│   └── convergence.py          #   C1–C4 signals + hard cap
-├── layer3/                     # Layer 3: Diversity Seeding
-│   ├── seeder.py               #   Topology repulsion via GED + semantic distance
-│   ├── topology.py             #   Graph representations, GED, classifier
-│   └── landscape.py            #   Design landscape (GED matrix, MDS, UMAP)
-├── skill/                      # SKILL.md document management
-│   ├── document.py             #   Parse/render K/R/T/P sections
-│   ├── versioning.py           #   Git-based versioning with trace citations
-│   └── compactor.py            #   Anti-drift consolidation (C4 trigger)
-├── tau_adapter.py              # τ-bench integration
-├── sop_adapter.py              # SOPBench integration
-├── benchmarks.py               # GAIA, ALFWorld, WebArena, Tabular loaders
-├── meta_client.py              # Provider-aware LLM client factory
-├── tools.py                    # Agent tool definitions
-├── tracing.py                  # OpenTelemetry trace collection
-└── tracking.py                 # MLflow experiment tracking
-
-run_experiment.py               # Primary entry point: τ-bench + GAIA experiments
-run_sop.py                      # SOPBench experiments (bank, healthcare)
-configs/default.yaml            # Default configuration
-vendor/tau_bench/               # Vendored τ-bench source (ToolCallingAgent baseline)
-vendor/sopbench/                # Vendored SOPBench source
-
-tests/test_core.py              # Unit tests
-smoketest.py                    # Component smoke tests
-test_e2e.py                     # End-to-end integration tests
-dashboard/app.py                # Streamlit real-time monitoring UI
-```
-
 ## Setup
 
 **Requirements:** Python >= 3.11
@@ -169,14 +127,6 @@ results/
 
 Each JSON contains: `auc_history`, `ec_history`, `convergence_history`, `topology_gallery`, `routing_stats`, `k_section_snapshots`, `ged_matrix`, `umap_coords`, `timing_history`, and full task-level results.
 
-### Monitoring
-
-```bash
-streamlit run dashboard/app.py
-```
-
-The dashboard provides real-time AUC curves, EC distributions, convergence signal gauges, GED heatmaps, and UMAP projections of the design landscape.
-
 ## Configuration
 
 Default config is in [configs/default.yaml](configs/default.yaml). Key parameters:
@@ -192,22 +142,3 @@ Default config is in [configs/default.yaml](configs/default.yaml). Key parameter
 | `outer_loop.n_outer` | 6 | Number of outer loop iterations |
 | `outer_loop.min_ged` | 3 | Minimum GED for topology repulsion |
 
-## Appendix Diagnostics
-
-The experiment automatically captures data for paper appendices:
-
-- **Topology Gallery**: Best topology per outer loop — roles, edges, entry point, AUC, convergence iteration
-- **Routing Stats**: Per-iteration routing efficiency — skip rate (conditional entry reuse), full routing counts
-- **K Section Snapshots**: Domain knowledge evolution — word count, rule count, full text at each outer loop
-- **Per-task traces**: Agent messages, tool calls, routing decisions for representative examples
-
-## Citation
-
-```bibtex
-@inproceedings{song2026abstral,
-  title={ABSTRAL: Automated Multi-Agent System Design via Skill-Referenced Adaptive Search},
-  author={Song, Weijia and Yue, Jiashu and Pang, Zhe},
-  booktitle={Conference on Language Modeling (COLM)},
-  year={2026}
-}
-```
