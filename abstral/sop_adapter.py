@@ -196,16 +196,16 @@ def wrap_sop_tools(domain_system, assistant_info: dict) -> List[StructuredTool]:
         tool_desc = func_info.get("description", tool_name)
         params = func_info.get("parameters", {})
 
-        # Skip exit_conversation — handled by runner
-        if tool_name == "exit_conversation":
-            continue
-
         # Build Pydantic model for args schema
         args_model = _openai_schema_to_pydantic(tool_name, params)
 
         # Build wrapper bound to domain_system
+        # exit_conversation is a standalone signal (not on domain_system);
+        # the runner intercepts it, but the LLM needs to see it as a valid tool.
         def make_fn(tn=tool_name, ds=domain_system):
             def fn(**kwargs) -> str:
+                if tn == "exit_conversation":
+                    return "Conversation ended."
                 clean_kwargs = {k: v for k, v in kwargs.items() if v is not None}
                 try:
                     method = getattr(ds, tn, None)

@@ -75,6 +75,10 @@ def save_results(state: PipelineState, experiment_name: str, output_dir: Path):
         "cumulative_api_calls": state.cumulative_api_calls,
         "seed_history": state.seed_history,
         "section_diffs": state.section_diffs,
+        # Appendix diagnostics
+        "routing_stats": getattr(state, "routing_stats", None),
+        "k_section_snapshots": getattr(state, "k_section_snapshots", None),
+        "topology_gallery": getattr(state, "topology_gallery", None),
         "log_lines": state.log_lines[-500:],
         "last_error": state.last_error,
     }

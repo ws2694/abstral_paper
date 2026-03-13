@@ -151,6 +151,17 @@ class AgentBuilder:
             """Reducer: keep the last written value."""
             return new
 
+        def _merge_visit_counts(existing, new):
+            """Reducer: merge per-node visit counters."""
+            if not existing:
+                return new or {}
+            if not new:
+                return existing
+            merged = dict(existing)
+            for k, v in new.items():
+                merged[k] = max(merged.get(k, 0), v)
+            return merged
+
         class AgentState(TypedDict):
             messages: Annotated[list, add_messages]
             task: str
@@ -159,6 +170,7 @@ class AgentBuilder:
             iteration_count: Annotated[int, _last_value]
             routing_context: Annotated[str, _last_value]  # analysis from non-tool agents
             route_to: Annotated[str, _last_value]  # explicit routing directive from non-tool agents
+            _visit_counts: Annotated[dict, _merge_visit_counts]  # per-node visit tracking for loop prevention
 
         # Build the graph — full multi-agent for BOTH modes
         graph = StateGraph(AgentState)
@@ -219,21 +231,25 @@ class AgentBuilder:
         # - HIERARCHICAL: manager↔specialist round-trips need ~2× roles
         # - DEBATE: multiple argumentation rounds need ~3× roles
         # - DYNAMIC_ROUTING: router + one specialist path
-        # Floor of 8 ensures even small topologies can handle complex tasks.
+        #
+        # For τ-bench/SOPBench (benchmark_mode="tau"): cap at 4. The tool_call_guard
+        # routes to END when a tool agent produces tool_calls, so the typical path
+        # is: entry → (maybe 1 router) → tool agent → END = 2-3 nodes. Higher budgets
+        # waste tokens on routing loops when agents produce text-only responses.
         n = len(spec.roles)
         family = spec.topology_family
         if family == TopologyFamily.SINGLE:
-            max_agent_steps = 8
+            max_agent_steps = 8 if benchmark_mode == "gaia" else 3
         elif family in (TopologyFamily.PIPELINE, TopologyFamily.ENSEMBLE):
-            max_agent_steps = max(n + 2, 8)
+            max_agent_steps = max(n + 2, 8) if benchmark_mode == "gaia" else min(n + 1, 4)
         elif family == TopologyFamily.HIERARCHICAL:
-            max_agent_steps = max(n * 2, 8)
+            max_agent_steps = max(n * 2, 8) if benchmark_mode == "gaia" else min(n, 4)
         elif family == TopologyFamily.DEBATE:
-            max_agent_steps = max(n * 3, 10)
+            max_agent_steps = max(n * 3, 10) if benchmark_mode == "gaia" else min(n + 1, 4)
         elif family == TopologyFamily.DYNAMIC_ROUTING:
-            max_agent_steps = max(n + 2, 8)
+            max_agent_steps = max(n + 2, 8) if benchmark_mode == "gaia" else min(n + 1, 4)
         else:
-            max_agent_steps = max(n + 2, 8)
+            max_agent_steps = max(n + 2, 8) if benchmark_mode == "gaia" else 4
 
         logger.info(
             f"Step budget: family={family.value}, n_roles={n}, "
@@ -308,10 +324,24 @@ class AgentBuilder:
         1. Explicit route_to state field (set by non-tool agents)
         2. Exact agent name match in last message text
         3. First target as fallback
+
+        Design-level loop prevention:
+        - Global step budget (iteration_count >= max_steps → END)
+        - Per-node visit cap: no agent visited more than 2x per invocation
+          (prevents A→B→A→B→... ping-pong in hierarchical/debate topologies)
+        - route_to consumed after use (cleared to prevent re-triggering)
         """
         def router(state) -> str:
             if state.get("iteration_count", 0) >= max_steps:
                 return "__end__"
+
+            # Per-node visit tracking: terminate if any agent visited > 2x
+            visit_counts = state.get("_visit_counts", {})
+            current_agent = state.get("current_agent", "")
+            if current_agent:
+                count = visit_counts.get(current_agent, 0)
+                if count >= 2:
+                    return "__end__"
 
             # Priority 1: Explicit route_to field from non-tool agent
             route_to = state.get("route_to", "")
@@ -522,18 +552,28 @@ class AgentBuilder:
                     import re as _re
                     route_match = _re.search(r"ROUTE_TO:\s*(\S+)", response.content, _re.IGNORECASE)
                     route_target = route_match.group(1) if route_match else ""
+                    # Update visit counts for loop prevention
+                    visits = dict(state.get("_visit_counts", {}) or {})
+                    visits[role.name] = visits.get(role.name, 0) + 1
                     return {
                         "messages": [],  # don't pollute conversation history
                         "current_agent": role.name,
                         "routing_context": response.content,
                         "route_to": route_target,
                         "iteration_count": state.get("iteration_count", 0) + 1,
+                        "_visit_counts": visits,
                     }
 
+                # Tool agent or GAIA: update visit counts and clear route_to
+                # (consumed — prevents re-triggering on next routing decision)
+                visits = dict(state.get("_visit_counts", {}) or {})
+                visits[role.name] = visits.get(role.name, 0) + 1
                 return {
                     "messages": [response],
                     "current_agent": role.name,
+                    "route_to": "",  # consumed — clear to prevent stale routing
                     "iteration_count": state.get("iteration_count", 0) + 1,
+                    "_visit_counts": visits,
                 }
 
             # GAIA: exceeded max tool rounds — force a final answer

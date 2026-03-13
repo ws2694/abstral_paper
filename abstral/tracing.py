@@ -106,6 +106,11 @@ class TraceManager:
                     )
                 agent_flow = "\n".join(flow_parts)
 
+            # Count tool calls from agent messages
+            n_tool_calls = 0
+            if hasattr(r, "agent_messages") and r.agent_messages:
+                n_tool_calls = sum(1 for am in r.agent_messages if am.get("type") == "tool_call")
+
             trace = {
                 "id": r.trace_id,
                 "status": "success" if r.success else "error",
@@ -116,6 +121,7 @@ class TraceManager:
                 "token_count": r.token_count,
                 "agent_flow": agent_flow,
                 "n_agent_steps": len(r.agent_messages) if hasattr(r, "agent_messages") else 0,
+                "n_tool_calls": n_tool_calls,
             }
 
             trace_set.traces.append(trace)

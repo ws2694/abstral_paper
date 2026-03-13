@@ -38,10 +38,16 @@ the SKILL.md document based on diagnosed evidence from trace analysis.
    - EC5 (Emergent Pattern) → T section (Template Library)
 
 2. Every edit must cite the motivating trace ID(s).
-3. Prefer ADDING new rules over modifying existing ones.
-4. Only REMOVE rules when they are directly contradicted by new evidence.
-5. Keep rules concise and actionable (one rule per bullet point).
-6. Include the trace ID citation inline: `[trace: <id>]`
+3. Keep rules concise and actionable (one rule per bullet point).
+4. Include the trace ID citation inline: `[trace: <id>]`
+5. **CRITICAL for R section (Topology Reasoning)**: When evidence says
+   a topology is failing and recommends a DIFFERENT topology, you MUST:
+   - REMOVE or REPLACE any rules that recommend the failing topology
+   - The new topology recommendation should be the FIRST and most prominent rule
+   - Do NOT keep both "Start with X topology" and "prefer Y topology" — that
+     creates a contradiction. Pick ONE based on the evidence.
+6. For non-topology sections: prefer adding new rules over modifying existing ones.
+   Only remove rules when directly contradicted by new evidence.
 
 ## Current Section Content: {section_key}
 
@@ -54,9 +60,11 @@ the SKILL.md document based on diagnosed evidence from trace analysis.
 ## Instructions
 
 Generate the updated section content that incorporates the evidence.
-Add new rules as bullet points. Preserve all existing rules unless
-they are directly contradicted. Return ONLY the section content
-(not the header)."""
+For the R section: if evidence recommends changing topology, REPLACE the old
+topology recommendation entirely — do not preserve contradicting rules.
+For other sections: add new rules as bullet points, preserving existing ones
+unless directly contradicted.
+Return ONLY the section content (not the header)."""
 
 
 class UpdateResult(BaseModel):
@@ -162,6 +170,23 @@ class SkillUpdater:
         # Update metadata
         skill_doc.metadata["iteration"] = str(iteration)
 
+        # Fix A: Update topology_family metadata when EC2 evidence suggests change
+        ec2_evidence = [ev for ev in evidence if ev.ec_class == EvidenceClass.EC2]
+        if ec2_evidence and "R" in sections_changed:
+            new_topology = self._detect_topology_change(ec2_evidence, skill_doc)
+            if new_topology:
+                old_topology = skill_doc.metadata.get("topology_family", "unknown")
+                skill_doc.metadata["topology_family"] = new_topology
+                # Fix C: Update preamble to match new topology
+                if "Seed topology:" in skill_doc.preamble:
+                    skill_doc.preamble = skill_doc.preamble.replace(
+                        f"Seed topology: {old_topology}",
+                        f"Seed topology: {new_topology}",
+                    )
+                logger.info(
+                    f"Topology family updated: {old_topology} → {new_topology}"
+                )
+
         # Compute EC distribution for commit tag
         ec_dist: dict[str, int] = {}
         for ev in evidence:
@@ -204,6 +229,65 @@ class SkillUpdater:
             f"- **Specification**: {ev.suggested_edit}\n"
             f"- **Failure prevented**: {ev.failed_trace_summary[:200] if ev.failed_trace_summary else 'N/A'}"
         )
+
+    def _detect_topology_change(
+        self,
+        ec2_evidence: list[TraceEvidence],
+        skill_doc: SkillDocument,
+    ) -> str | None:
+        """Detect if EC2 evidence recommends a different topology family.
+
+        Scans suggested edits and the updated R section for topology keywords.
+        Returns the new topology name if a change is detected, None otherwise.
+        """
+        current = skill_doc.metadata.get("topology_family", "")
+        # Check evidence suggested edits for topology keywords
+        topology_keywords = {
+            "single": "single",
+            "single agent": "single",
+            "pipeline": "pipeline",
+            "2-agent": "pipeline",
+            "two-agent": "pipeline",
+            "hierarchical": "hierarchical",
+            "hierarchy": "hierarchical",
+            "ensemble": "ensemble",
+            "debate": "debate",
+            "dynamic_routing": "dynamic_routing",
+            "dynamic routing": "dynamic_routing",
+        }
+        # Look at what the evidence recommends
+        for ev in ec2_evidence:
+            text = (ev.suggested_edit + " " + ev.reasoning).lower()
+            # Look for "prefer X", "use X", "switch to X", "simplify to X"
+            for keyword, family in topology_keywords.items():
+                if family == current:
+                    continue
+                if any(phrase in text for phrase in [
+                    f"prefer {keyword}",
+                    f"use {keyword}",
+                    f"switch to {keyword}",
+                    f"simplify to {keyword}",
+                    f"use a {keyword}",
+                    f"prefer a {keyword}",
+                ]):
+                    logger.info(f"EC2 evidence recommends topology change: {current} → {family}")
+                    return family
+
+        # Also scan the updated R section content
+        r_content = skill_doc.get_section("R").lower()
+        for keyword, family in topology_keywords.items():
+            if family == current:
+                continue
+            if any(phrase in r_content for phrase in [
+                f"prefer {keyword}",
+                f"use {keyword}",
+                f"start with a {keyword}",
+                f"start with {keyword}",
+            ]):
+                logger.info(f"R section now recommends: {family} (was {current})")
+                return family
+
+        return None
 
     def _update_section(
         self,

@@ -11,9 +11,11 @@ Sandbox constraints (§3.2):
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -296,6 +298,22 @@ class TauBenchRunner(AgentRunner):
             task_split=config.tau_bench.task_split,
         )
         self.max_turns = config.tau_bench.max_conversation_turns
+        self._invoke_pool = ThreadPoolExecutor(max_workers=1)
+
+    @staticmethod
+    def _invoke_with_timeout(graph, state, config, timeout_sec=120):
+        """Invoke graph with a hard timeout to prevent indefinite hangs.
+
+        Uses a thread pool so we can enforce a wall-clock deadline even when
+        the underlying HTTP call blocks.  Returns the final state or raises
+        FuturesTimeoutError.
+        """
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            future = pool.submit(graph.invoke, state, config)
+            return future.result(timeout=timeout_sec)
+        finally:
+            pool.shutdown(wait=False)
 
     @staticmethod
     def _windowed_history(messages, window_size=20):
@@ -473,13 +491,27 @@ class TauBenchRunner(AgentRunner):
                     "iteration_count": 0,
                     "routing_context": last_routing_context,
                     "route_to": "",
+                    "_visit_counts": {},  # reset per-invocation visit tracking
                 }
+
+                # Per-invoke timeout: remaining wall clock, capped at 120s
+                remaining_wc = max(30, wall_clock_limit - (time.monotonic() - start_time))
+                invoke_timeout = min(remaining_wc, 120)
 
                 final_state = None
                 for attempt in range(6):
                     try:
-                        final_state = compiled_graph.invoke(initial_state, config=config)
+                        final_state = self._invoke_with_timeout(
+                            compiled_graph, initial_state, config,
+                            timeout_sec=invoke_timeout,
+                        )
                         break
+                    except FuturesTimeoutError:
+                        logger.warning(
+                            f"Task {task.id} turn {turn}: graph.invoke timed out "
+                            f"after {invoke_timeout:.0f}s (attempt {attempt+1}/6)"
+                        )
+                        break  # Don't retry timeouts — move on
                     except Exception as e:
                         err_str = str(e)
                         if "429" in err_str or "rate limit" in err_str.lower():
@@ -506,7 +538,9 @@ class TauBenchRunner(AgentRunner):
                         else:
                             raise
                 if final_state is None and not done:
-                    raise RuntimeError("Rate limit exceeded after 6 retries")
+                    # Timed out or exhausted retries — skip this turn gracefully
+                    logger.warning(f"Task {task.id} turn {turn}: no result, skipping turn")
+                    break
 
                 # If recovery reset the conversation, skip to next turn
                 if final_state is None:
@@ -717,19 +751,43 @@ class SOPBenchRunner(AgentRunner):
             total_tokens = 0
             done = False
 
-            # Initial user message
+            # Inject SOPBench assistant instructions (constraint rules) as
+            # system context. This contains task-specific dependency rules
+            # that the agent MUST follow for dirgraph_satisfied to pass.
+            sop_instructions = assistant_info.get("instructions", "")
+            if sop_instructions:
+                from langchain_core.messages import SystemMessage
+                conversation_history.append(SystemMessage(
+                    content=f"### SOPBench Operating Instructions ###\n\n{sop_instructions}\n\n"
+                    f"IMPORTANT: You must call tools to complete this task. "
+                    f"Follow the constraint rules above exactly. "
+                    f"Call exit_conversation when done."
+                ))
+
+            # Initial user message — use task["user_prompt"] which is the
+            # natural language customer request with real data embedded
+            # (matches original SOPBench run_simulation.py line 179).
             user_prompt = task_data.get("user_prompt", "")
             if not user_prompt:
-                user_prompt = user_info.get("instructions", "Help me with my request.")
-            conversation_history.append(HumanMessage(content=user_prompt))
+                # Fallback: construct from user_instruction + user_known
+                user_instruction = task_data.get("user_instruction", "")
+                user_known = task_data.get("user_known", {})
+                if user_instruction:
+                    user_prompt = user_instruction
+                    if user_known:
+                        user_prompt += " Here is my information: " + ", ".join(
+                            f'my {k} is "{v}"' for k, v in user_known.items()
+                        )
+                else:
+                    user_prompt = "Help me with my request."
 
-            # Also provide user_known params as follow-up if available
-            user_known = task_data.get("user_known", {})
-            if user_known:
-                known_str = "Here is my information: " + ", ".join(
-                    f'"{k}" is "{v}"' for k, v in user_known.items()
-                )
-                conversation_history.append(HumanMessage(content=known_str))
+            # Add exit instruction (matches SOPBench default user message)
+            user_prompt += (
+                "\n\nPlease directly use the most appropriate tool to solve my request "
+                "as quickly as possible and use the `exit_conversation` action to end "
+                "our conversation if you have completed my request or cannot assist me."
+            )
+            conversation_history.append(HumanMessage(content=user_prompt))
 
             config = {
                 "tags": [f"run_id:{run_id}", f"task_id:{task.id}"],
@@ -760,13 +818,28 @@ class SOPBenchRunner(AgentRunner):
                     "current_agent": "",
                     "result": "",
                     "iteration_count": 0,
+                    "routing_context": "",
+                    "route_to": "",
+                    "_visit_counts": {},
                 }
 
-                # Invoke graph with retry
+                # Invoke graph with retry + timeout
+                remaining_wc = max(30, wall_clock_limit - (time.monotonic() - start_time))
+                invoke_timeout = min(remaining_wc, 120)
+
                 final_state = None
                 for attempt in range(6):
                     try:
-                        final_state = compiled_graph.invoke(initial_state, config=config)
+                        final_state = TauBenchRunner._invoke_with_timeout(
+                            compiled_graph, initial_state, config,
+                            timeout_sec=invoke_timeout,
+                        )
+                        break
+                    except FuturesTimeoutError:
+                        logger.warning(
+                            f"Task {task.id} turn {turn}: graph.invoke timed out "
+                            f"after {invoke_timeout:.0f}s"
+                        )
                         break
                     except Exception as e:
                         err_str = str(e)
@@ -774,11 +847,38 @@ class SOPBenchRunner(AgentRunner):
                             wait = min(2 ** attempt * 10, 120)
                             logger.warning(f"Rate limit hit, waiting {wait}s (attempt {attempt+1}/6)")
                             time.sleep(wait)
+                        elif "role 'tool' must be a response" in err_str:
+                            # Malformed history — strip all tool-related messages and retry
+                            logger.warning(
+                                f"Task {task.id} turn {turn}: malformed history, "
+                                f"stripping tool messages and retrying"
+                            )
+                            from langchain_core.messages import HumanMessage as _HM, AIMessage as _AI
+                            clean = []
+                            for m in windowed:
+                                if isinstance(m, ToolMessage):
+                                    continue
+                                if isinstance(m, _AI) and hasattr(m, 'tool_calls') and m.tool_calls:
+                                    # Convert to plain text AI message
+                                    tools_desc = ", ".join(tc["name"] for tc in m.tool_calls)
+                                    clean.append(_AI(content=f"[Called tools: {tools_desc}]"))
+                                else:
+                                    clean.append(m)
+                            initial_state["messages"] = clean
+                            try:
+                                final_state = TauBenchRunner._invoke_with_timeout(
+                                    compiled_graph, initial_state, config,
+                                    timeout_sec=invoke_timeout,
+                                )
+                                break
+                            except Exception:
+                                raise
                         else:
                             raise
 
                 if final_state is None:
-                    raise RuntimeError("Rate limit exceeded after 6 retries")
+                    logger.warning(f"Task {task.id} turn {turn}: no result, skipping turn")
+                    continue
 
                 # Extract new messages from graph output
                 all_out = final_state["messages"]
@@ -873,6 +973,20 @@ class SOPBenchRunner(AgentRunner):
                     content_lower = last_ai_msg.content.lower()
                     if any(w in content_lower for w in ["goodbye", "have a great day", "is there anything else"]):
                         done = True
+                    elif not done:
+                        # Agent produced text — send the SOPBench default user
+                        # response with known data to keep the conversation going.
+                        # This matches run_simulation.py:206-213.
+                        user_known = task_data.get("user_known", {})
+                        default_reply = "Here is all the information I can provide:\n"
+                        default_reply += json.dumps(user_known, indent=2)
+                        default_reply += (
+                            "\n\nPlease directly use the most appropriate tool to "
+                            "solve my request as quickly as possible and use the "
+                            "`exit_conversation` action to end our conversation if "
+                            "you have completed my request or cannot assist me."
+                        )
+                        conversation_history.append(HumanMessage(content=default_reply))
 
             # Post-hoc evaluation via oracle
             final_database = domain_system.evaluation_get_database()
@@ -886,8 +1000,13 @@ class SOPBenchRunner(AgentRunner):
                 task_id=task.id,
                 success=success,
                 output=f"reward={reward:.1f}, turns={turn+1}, tools={tool_call_count}, "
+                       f"no_err={eval_result.get('no_tool_call_error', False)}, "
+                       f"constraint_ok={eval_result.get('constraint_not_violated', False)}, "
                        f"db_match={eval_result.get('database_match', False)}, "
-                       f"constraint_ok={eval_result.get('constraint_not_violated', False)}",
+                       f"dirgraph={eval_result.get('dirgraph_satisfied', False)}, "
+                       f"action_ok={eval_result.get('action_called_correctly', False)}, "
+                       f"goal={eval_result.get('user_goal', '?')}, "
+                       f"should_succeed={eval_result.get('action_should_succeed', '?')}",
                 latency_ms=elapsed_ms,
                 trace_id=trace_id,
                 token_count=total_tokens,

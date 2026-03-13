@@ -275,8 +275,9 @@ def run_pipeline(
                     )
                 else:
                     seed_doc = SkillDocument.create_seed(benchmark, "hierarchical")
-                state.current_phase = f"Outer {outer}: Seeding hierarchical"
-                state.log(f"[SEED] Initial seed topology: hierarchical")
+                seed_topology = seed_doc.metadata.get("topology_family", "hierarchical")
+                state.current_phase = f"Outer {outer}: Seeding {seed_topology}"
+                state.log(f"[SEED] Initial seed topology: {seed_topology}")
                 state.log(f"[SEED] Seed K section: {len(seed_doc.K.split())} words")
                 state.log(f"[SEED] Seed R section: {len(seed_doc.R.split())} words")
                 state.log(f"[SEED] Seed T section: {len(seed_doc.T.split())} words")
@@ -365,7 +366,7 @@ def run_pipeline(
 
                     if (target_from_r
                         and not _families_compatible(produced_family.value, target_from_r)
-                        and outer > 1):
+                        and inner > 1):
                         state.log(f"[BUILD] WARNING: Target family was '{target_from_r}' but produced '{produced_family.value}' (declared: {declared_family.value})")
                         state.log(f"[BUILD] Retrying BUILD with explicit topology enforcement...")
                         # Retry once with stronger constraint
@@ -446,64 +447,171 @@ def run_pipeline(
                         domain_knowledge=_domain_k,
                     )
                     state.log(f"[RUN] LangGraph compiled successfully. Graph nodes: {list(compiled_graph.get_graph().nodes) if hasattr(compiled_graph, 'get_graph') else 'N/A'}")
-                    tasks = load_benchmark_tasks(
-                        benchmark=benchmark,
-                        split="val",
-                        n_instances=config.inner_loop.val_batch_size,
-                    )
-                    state.log(f"[RUN] Loaded {len(tasks)} benchmark tasks")
-                    run_tag = f"o{outer}-i{inner}-{benchmark}"
-                    run_result = runner.run_batch(compiled_graph, tasks, run_tag=run_tag)
-                    auc = run_result.success_rate
-                    run_dur = time.time() - run_start
-                    phase_timings["run"] = round(run_dur, 2)
-                    state.cumulative_tokens += run_result.total_tokens
-                    state.cumulative_api_calls += len(run_result.results)
-                    state.log(f"[RUN] Complete in {run_dur:.1f}s")
-                    state.log(f"[RUN]   AUC / Success Rate: {auc:.4f}")
-                    state.log(f"[RUN]   Succeeded: {run_result.metrics.get('n_succeeded', 0)}/{run_result.metrics.get('n_tasks', 0)}")
-                    state.log(f"[RUN]   Tokens used (this batch): {run_result.total_tokens}")
-                    state.log(f"[RUN]   Cumulative tokens (all iters): {state.cumulative_tokens}")
-                    state.log(f"[RUN]   Per-task results:")
-                    task_details = []
-                    for idx, r in enumerate(run_result.results):
-                        status = "SUCCESS" if r.success else "FAIL"
-                        output_preview = (r.output[:150].replace("\n", " ") if r.output else "(no output)")
-                        error_info = f" | error: {r.error[:100]}" if r.error else ""
-                        state.log(f"[RUN]     [{idx+1}] {status} | task={r.task_id} | tokens={r.token_count}{error_info}")
-                        state.log(f"[RUN]          output: \"{output_preview}\"")
-                        task_details.append({
-                            "task_id": r.task_id, "success": r.success,
-                            "tokens": r.token_count, "error": r.error,
-                            "output_preview": output_preview,
+
+                    # ── PRE-FLIGHT VALIDATION ──
+                    # Test the compiled graph on a dummy input to verify tool calls flow through.
+                    # If the graph is non-functional, skip the full batch (saves ~$5-10 per iteration).
+                    if (is_tau or is_sop) and len(spec.roles) > 1:
+                        state.log(f"[RUN] Pre-flight: testing graph on dummy input...")
+                        try:
+                            _preflight_state = {
+                                "messages": [{"role": "user", "content": "I need to change my flight booking."}],
+                                "task": "pre-flight validation",
+                                "current_agent": "",
+                                "result": "",
+                                "iteration_count": 0,
+                                "routing_context": "",
+                                "route_to": "",
+                                "_visit_counts": {},
+                            }
+                            _preflight_result = compiled_graph.invoke(
+                                _preflight_state,
+                                config={"recursion_limit": 25},
+                            )
+                            _pf_msgs = _preflight_result.get("messages", [])
+                            _pf_has_tools = any(
+                                hasattr(m, "tool_calls") and m.tool_calls
+                                for m in _pf_msgs
+                                if hasattr(m, "tool_calls")
+                            )
+                            _pf_agent = _preflight_result.get("current_agent", "")
+                            state.log(f"[RUN] Pre-flight result: {len(_pf_msgs)} messages, tools_fired={_pf_has_tools}, last_agent={_pf_agent}")
+
+                            if not _pf_has_tools and not _pf_agent:
+                                state.log(f"[RUN] PRE-FLIGHT FAILED: Graph produced 0 tool calls and no agent was reached.")
+                                state.log(f"[RUN] Topology is non-functional. Skipping full batch, injecting EC2.")
+                                from abstral.config import EvidenceClass, TraceEvidence, EC_SECTION_MAP
+                                synthetic_ev = TraceEvidence(
+                                    ec_class=EvidenceClass.EC2,
+                                    trace_id="preflight-no-tools",
+                                    failed_trace_summary=(
+                                        f"Pre-flight validation failed: the {family_name} topology with "
+                                        f"{len(spec.roles)} agents produced 0 tool calls on a dummy input. "
+                                        f"The graph is non-functional."
+                                    ),
+                                    succeeded_trace_summary="",
+                                    reasoning=(
+                                        f"The compiled {family_name} graph never reaches a tool-calling agent. "
+                                        f"This means NO task will succeed — running the full batch would waste "
+                                        f"tokens. The topology must be simplified: ensure entry_point routes to "
+                                        f"a tool-calling agent within 1 hop. Reduce to 2-3 agents max."
+                                    ),
+                                    suggested_edit=(
+                                        f"Simplify to a pipeline or single-agent topology. The current "
+                                        f"{family_name} graph with {len(spec.roles)} agents has broken routing."
+                                    ),
+                                    target_section=EC_SECTION_MAP[EvidenceClass.EC2],
+                                    confidence=0.95,
+                                )
+                                ec_dist = {"EC1": 0, "EC2": 1, "EC3": 0, "EC4": 0, "EC5": 0}
+                                run_dur = time.time() - run_start
+                                phase_timings["run"] = round(run_dur, 2)
+                                auc = 0.0
+                                run_result = BatchRunResult(run_id=f"o{outer}-i{inner}-{benchmark}-preflight-fail")
+                                run_result.results = []
+                                run_result.metrics = {"success_rate": 0, "n_tasks": 0, "n_succeeded": 0}
+                                state.task_results_history.append({
+                                    "outer": outer, "inner": inner, "auc": 0.0,
+                                    "n_tasks": 0, "n_succeeded": 0, "total_tokens": 0,
+                                    "run_time_s": round(run_dur, 2),
+                                    "error": "Pre-flight failed: 0 tool calls", "tasks": [],
+                                })
+                                state.evidence_history.append({
+                                    "outer": outer, "inner": inner,
+                                    "n_evidence": 1, "ec_dist": ec_dist,
+                                    "analyze_time_s": 0,
+                                    "evidence": [{
+                                        "ec_class": "EC2", "target_section": "R",
+                                        "confidence": 0.95,
+                                        "reasoning": synthetic_ev.reasoning,
+                                        "suggested_edit": synthetic_ev.suggested_edit,
+                                        "trace_id": "preflight-no-tools",
+                                    }],
+                                })
+                                # Skip RUN and ANALYZE — jump straight to UPDATE
+                                class _PreflightAnalysis:
+                                    evidence = [synthetic_ev]
+                                    ec_distribution = ec_dist
+                                    summary = "Pre-flight failed: graph non-functional"
+                                analysis = _PreflightAnalysis()
+                                # Signal to skip RUN+ANALYZE phases below
+                                _skip_run = True
+                            else:
+                                _skip_run = False
+                        except Exception as _pf_err:
+                            state.log(f"[RUN] Pre-flight error (non-fatal): {_pf_err}")
+                            _skip_run = False
+                    else:
+                        _skip_run = False
+
+                    if _skip_run:
+                        # Jump past RUN and ANALYZE — analysis already set above
+                        state.auc_history.append({
+                            "outer": outer, "inner": inner, "auc": 0.0,
+                            "benchmark": benchmark, "family": family_name,
                         })
-                    # Aggregate routing stats from individual RunResults
-                    batch_routing = {"routing_skips": 0, "routing_full": 0, "tasks_with_routing": 0}
-                    for r in run_result.results:
-                        meta = getattr(r, "metadata", {}) or {}
-                        batch_routing["routing_skips"] += meta.get("routing_skips", 0)
-                        batch_routing["routing_full"] += meta.get("routing_full", 0)
-                        if meta.get("routing_skips", 0) + meta.get("routing_full", 0) > 0:
-                            batch_routing["tasks_with_routing"] += 1
-                    total_routing = batch_routing["routing_skips"] + batch_routing["routing_full"]
-                    batch_routing["skip_rate"] = round(
-                        batch_routing["routing_skips"] / total_routing, 4
-                    ) if total_routing > 0 else 0.0
+                        ec_dist = analysis.ec_distribution
+                        state.ec_history.append({"outer": outer, "inner": inner, "ec_dist": ec_dist})
 
-                    state.routing_stats.append({
-                        "outer": outer, "inner": inner, "family": family_name,
-                        **batch_routing,
-                    })
+                    if not _skip_run:
+                        tasks = load_benchmark_tasks(
+                            benchmark=benchmark,
+                            split="val",
+                            n_instances=config.inner_loop.val_batch_size,
+                        )
+                        state.log(f"[RUN] Loaded {len(tasks)} benchmark tasks")
+                        run_tag = f"o{outer}-i{inner}-{benchmark}"
+                        run_result = runner.run_batch(compiled_graph, tasks, run_tag=run_tag)
+                        auc = run_result.success_rate
+                        run_dur = time.time() - run_start
+                        phase_timings["run"] = round(run_dur, 2)
+                        state.cumulative_tokens += run_result.total_tokens
+                        state.cumulative_api_calls += len(run_result.results)
+                        state.log(f"[RUN] Complete in {run_dur:.1f}s")
+                        state.log(f"[RUN]   AUC / Success Rate: {auc:.4f}")
+                        state.log(f"[RUN]   Succeeded: {run_result.metrics.get('n_succeeded', 0)}/{run_result.metrics.get('n_tasks', 0)}")
+                        state.log(f"[RUN]   Tokens used (this batch): {run_result.total_tokens}")
+                        state.log(f"[RUN]   Cumulative tokens (all iters): {state.cumulative_tokens}")
+                        state.log(f"[RUN]   Per-task results:")
+                        task_details = []
+                        for idx, r in enumerate(run_result.results):
+                            status = "SUCCESS" if r.success else "FAIL"
+                            output_preview = (r.output[:150].replace("\n", " ") if r.output else "(no output)")
+                            error_info = f" | error: {r.error[:100]}" if r.error else ""
+                            state.log(f"[RUN]     [{idx+1}] {status} | task={r.task_id} | tokens={r.token_count}{error_info}")
+                            state.log(f"[RUN]          output: \"{output_preview}\"")
+                            task_details.append({
+                                "task_id": r.task_id, "success": r.success,
+                                "tokens": r.token_count, "error": r.error,
+                                "output_preview": output_preview,
+                            })
+                        # Aggregate routing stats from individual RunResults
+                        batch_routing = {"routing_skips": 0, "routing_full": 0, "tasks_with_routing": 0}
+                        for r in run_result.results:
+                            meta = getattr(r, "metadata", {}) or {}
+                            batch_routing["routing_skips"] += meta.get("routing_skips", 0)
+                            batch_routing["routing_full"] += meta.get("routing_full", 0)
+                            if meta.get("routing_skips", 0) + meta.get("routing_full", 0) > 0:
+                                batch_routing["tasks_with_routing"] += 1
+                        total_routing = batch_routing["routing_skips"] + batch_routing["routing_full"]
+                        batch_routing["skip_rate"] = round(
+                            batch_routing["routing_skips"] / total_routing, 4
+                        ) if total_routing > 0 else 0.0
 
-                    state.task_results_history.append({
-                        "outer": outer, "inner": inner, "auc": auc,
-                        "n_tasks": len(run_result.results),
-                        "n_succeeded": run_result.metrics.get("n_succeeded", 0),
-                        "total_tokens": run_result.total_tokens,
-                        "run_time_s": round(run_dur, 2),
-                        "routing": batch_routing,
-                        "tasks": task_details,
-                    })
+                        state.routing_stats.append({
+                            "outer": outer, "inner": inner, "family": family_name,
+                            **batch_routing,
+                        })
+
+                        state.task_results_history.append({
+                            "outer": outer, "inner": inner, "auc": auc,
+                            "n_tasks": len(run_result.results),
+                            "n_succeeded": run_result.metrics.get("n_succeeded", 0),
+                            "total_tokens": run_result.total_tokens,
+                            "run_time_s": round(run_dur, 2),
+                            "routing": batch_routing,
+                            "tasks": task_details,
+                        })
                 except Exception as e:
                     run_dur = time.time() - run_start
                     phase_timings["run"] = round(run_dur, 2)
@@ -519,146 +627,213 @@ def run_pipeline(
                         "run_time_s": round(run_dur, 2), "error": str(e), "tasks": [],
                     })
 
-                state.auc_history.append({
-                    "outer": outer, "inner": inner, "auc": auc,
-                    "benchmark": benchmark, "family": family_name,
-                })
-
-                # ── ANALYZE ──
-                state.current_phase = f"O{outer} I{inner}: ANALYZE"
-                state.log(f"[ANALYZE] Starting contrastive trace analysis...")
-                analyze_start = time.time()
-                try:
-                    # Use trace set built by runner (local, no remote API)
-                    trace_set = run_result.trace_set
-                    if trace_set is None:
-                        trace_set = TraceSet(run_id=run_result.run_id)
-
-                    # Enrich traces with topology info for EC classification
-                    topo_info = {
-                        "family": family_name,
-                        "n_roles": len(spec.roles),
-                        "roles": [{"name": rl.name, "type": rl.functional_type.value} for rl in spec.roles],
-                        "edges": [{"src": e.source, "tgt": e.target} for e in spec.edges],
-                    }
-                    for trace in trace_set.traces:
-                        trace["topology_info"] = topo_info
-
-                    state.log(f"[ANALYZE] Trace set: {len(trace_set.traces)} total, {len(trace_set.succeeded)} succeeded, {len(trace_set.failed)} failed")
-
-                    if not trace_set.traces:
-                        # No traces at all — RUN produced 0 results. Generate synthetic evidence.
-                        state.log(f"[ANALYZE] No traces available (RUN produced 0 results). Skipping LLM analysis.")
-                        state.log(f"[ANALYZE] Generating synthetic EC2 evidence (topology/execution failure).")
-                        from abstral.config import EvidenceClass, TraceEvidence, EC_SECTION_MAP
-                        run_error_msg = state.task_results_history[-1].get("error", "Unknown RUN failure") if state.task_results_history else "Unknown"
-                        synthetic_ev = TraceEvidence(
-                            ec_class=EvidenceClass.EC2,
-                            trace_id="synthetic-no-traces",
-                            failed_trace_summary=f"RUN phase produced 0 results. Error: {str(run_error_msg)[:300]}",
-                            succeeded_trace_summary="",
-                            reasoning=f"The agent system failed to execute any tasks. This indicates a topology or construction failure. The RUN phase error was: {str(run_error_msg)[:200]}",
-                            suggested_edit="Review the R (Topology Reasoning) section. The current topology may be malformed or incompatible with the benchmark. Consider simplifying to a pipeline or single-agent topology.",
-                            target_section=EC_SECTION_MAP[EvidenceClass.EC2],
-                            confidence=0.9,
-                        )
-                        ec_dist = {"EC1": 0, "EC2": 1, "EC3": 0, "EC4": 0, "EC5": 0}
-
-                        class _SyntheticAnalysis:
-                            evidence = [synthetic_ev]
-                            ec_distribution = ec_dist
-                            summary = "Synthetic EC2: RUN produced 0 traces"
-                        analysis = _SyntheticAnalysis()
-
-                        analyze_dur = time.time() - analyze_start
-                        phase_timings["analyze"] = round(analyze_dur, 2)
-                        state.log(f"[ANALYZE] Complete (synthetic) in {analyze_dur:.1f}s — 1 synthetic EC2 evidence item")
-                        state.log(f"[ANALYZE]   Reasoning: {synthetic_ev.reasoning[:250]}")
-                        state.evidence_history.append({
-                            "outer": outer, "inner": inner,
-                            "n_evidence": 1, "ec_dist": ec_dist,
-                            "analyze_time_s": round(analyze_dur, 2),
-                            "evidence": [{
-                                "ec_class": "EC2", "target_section": "R",
-                                "confidence": 0.9,
-                                "reasoning": synthetic_ev.reasoning,
-                                "suggested_edit": synthetic_ev.suggested_edit,
-                                "failed_trace_summary": synthetic_ev.failed_trace_summary[:200],
-                                "trace_id": "synthetic-no-traces",
-                            }],
-                        })
-                    else:
-                        # Normal analysis with real traces
-                        n_pairs = len(analyzer.trace_manager.pair_traces(trace_set)) if hasattr(analyzer, 'trace_manager') else 0
-                        state.log(f"[ANALYZE] Contrastive pairs available: {n_pairs}")
-                        if n_pairs == 0:
-                            if trace_set.failed and not trace_set.succeeded:
-                                state.log(f"[ANALYZE] Mode: single-trace analysis (all tasks failed)")
-                            elif trace_set.succeeded and not trace_set.failed:
-                                state.log(f"[ANALYZE] Mode: emergent pattern detection (all tasks succeeded)")
-                            else:
-                                state.log(f"[ANALYZE] Mode: mixed but no contrastive pairs formed")
-                        else:
-                            state.log(f"[ANALYZE] Mode: contrastive pair analysis")
-
-                        analysis = analyzer.analyze_traces(skill_doc, trace_set)
-                        ec_dist = analysis.ec_distribution
-                        analyze_dur = time.time() - analyze_start
-                        phase_timings["analyze"] = round(analyze_dur, 2)
-                        state.log(f"[ANALYZE] Complete in {analyze_dur:.1f}s")
-                        state.log(f"[ANALYZE]   Evidence items: {len(analysis.evidence)}")
-                        state.log(f"[ANALYZE]   EC distribution: {ec_dist}")
-                        state.log(f"[ANALYZE]   Summary: {analysis.summary}")
-
-                        evidence_details = []
-                        for idx, ev in enumerate(analysis.evidence):
-                            state.log(f"[ANALYZE]   Evidence #{idx+1}:")
-                            state.log(f"[ANALYZE]     EC class: {ev.ec_class.value}")
-                            state.log(f"[ANALYZE]     Target section: {ev.target_section}")
-                            state.log(f"[ANALYZE]     Confidence: {ev.confidence:.2f}")
-                            state.log(f"[ANALYZE]     Reasoning: {ev.reasoning[:250]}")
-                            state.log(f"[ANALYZE]     Suggested edit: {ev.suggested_edit[:250]}")
-                            if ev.failed_trace_summary:
-                                state.log(f"[ANALYZE]     Failed trace: {ev.failed_trace_summary[:150]}")
-                            if ev.succeeded_trace_summary:
-                                state.log(f"[ANALYZE]     Succeeded trace: {ev.succeeded_trace_summary[:150]}")
-                            state.log(f"[ANALYZE]     Trace ID: {ev.trace_id}")
-                            evidence_details.append({
-                                "ec_class": ev.ec_class.value,
-                                "target_section": ev.target_section,
-                                "confidence": ev.confidence,
-                                "reasoning": ev.reasoning,
-                                "suggested_edit": ev.suggested_edit,
-                                "failed_trace_summary": ev.failed_trace_summary[:200] if ev.failed_trace_summary else "",
-                                "trace_id": ev.trace_id,
-                            })
-                        state.evidence_history.append({
-                            "outer": outer, "inner": inner,
-                            "n_evidence": len(analysis.evidence),
-                            "ec_dist": ec_dist,
-                            "analyze_time_s": round(analyze_dur, 2),
-                            "evidence": evidence_details,
-                        })
-                except Exception as e:
-                    analyze_dur = time.time() - analyze_start
-                    phase_timings["analyze"] = round(analyze_dur, 2)
-                    state.log(f"[ANALYZE] FAILED after {analyze_dur:.1f}s: {e}")
-                    state.log(f"[ANALYZE] Full traceback: {traceback.format_exc()}")
-                    ec_dist = {"EC1": 0, "EC2": 0, "EC3": 0, "EC4": 0, "EC5": 0}
-
-                    class _EmptyAnalysis:
-                        evidence = []
-                        ec_distribution = ec_dist
-                        summary = "Analysis failed"
-                    analysis = _EmptyAnalysis()
-                    state.evidence_history.append({
-                        "outer": outer, "inner": inner,
-                        "n_evidence": 0, "ec_dist": ec_dist,
-                        "analyze_time_s": round(analyze_dur, 2),
-                        "evidence": [], "error": str(e),
+                if not _skip_run:
+                    state.auc_history.append({
+                        "outer": outer, "inner": inner, "auc": auc,
+                        "benchmark": benchmark, "family": family_name,
                     })
 
-                state.ec_history.append({"outer": outer, "inner": inner, "ec_dist": ec_dist})
+                # ── ANALYZE ── (skipped if pre-flight already set analysis)
+                if not _skip_run:
+                    state.current_phase = f"O{outer} I{inner}: ANALYZE"
+                    state.log(f"[ANALYZE] Starting contrastive trace analysis...")
+                    analyze_start = time.time()
+                    try:
+                        # Use trace set built by runner (local, no remote API)
+                        trace_set = run_result.trace_set
+                        if trace_set is None:
+                            trace_set = TraceSet(run_id=run_result.run_id)
+
+                        # Enrich traces with topology info for EC classification
+                        topo_info = {
+                            "family": family_name,
+                            "n_roles": len(spec.roles),
+                            "roles": [{"name": rl.name, "type": rl.functional_type.value} for rl in spec.roles],
+                            "edges": [{"src": e.source, "tgt": e.target} for e in spec.edges],
+                        }
+                        for trace in trace_set.traces:
+                            trace["topology_info"] = topo_info
+
+                        state.log(f"[ANALYZE] Trace set: {len(trace_set.traces)} total, {len(trace_set.succeeded)} succeeded, {len(trace_set.failed)} failed")
+
+                        if not trace_set.traces:
+                            # No traces at all — RUN produced 0 results. Generate synthetic evidence.
+                            state.log(f"[ANALYZE] No traces available (RUN produced 0 results). Skipping LLM analysis.")
+                            state.log(f"[ANALYZE] Generating synthetic EC2 evidence (topology/execution failure).")
+                            from abstral.config import EvidenceClass, TraceEvidence, EC_SECTION_MAP
+                            run_error_msg = state.task_results_history[-1].get("error", "Unknown RUN failure") if state.task_results_history else "Unknown"
+                            synthetic_ev = TraceEvidence(
+                                ec_class=EvidenceClass.EC2,
+                                trace_id="synthetic-no-traces",
+                                failed_trace_summary=f"RUN phase produced 0 results. Error: {str(run_error_msg)[:300]}",
+                                succeeded_trace_summary="",
+                                reasoning=f"The agent system failed to execute any tasks. This indicates a topology or construction failure. The RUN phase error was: {str(run_error_msg)[:200]}",
+                                suggested_edit="Review the R (Topology Reasoning) section. The current topology may be malformed or incompatible with the benchmark. Consider simplifying to a pipeline or single-agent topology.",
+                                target_section=EC_SECTION_MAP[EvidenceClass.EC2],
+                                confidence=0.9,
+                            )
+                            ec_dist = {"EC1": 0, "EC2": 1, "EC3": 0, "EC4": 0, "EC5": 0}
+
+                            class _SyntheticAnalysis:
+                                evidence = [synthetic_ev]
+                                ec_distribution = ec_dist
+                                summary = "Synthetic EC2: RUN produced 0 traces"
+                            analysis = _SyntheticAnalysis()
+
+                            analyze_dur = time.time() - analyze_start
+                            phase_timings["analyze"] = round(analyze_dur, 2)
+                            state.log(f"[ANALYZE] Complete (synthetic) in {analyze_dur:.1f}s — 1 synthetic EC2 evidence item")
+                            state.log(f"[ANALYZE]   Reasoning: {synthetic_ev.reasoning[:250]}")
+                            state.evidence_history.append({
+                                "outer": outer, "inner": inner,
+                                "n_evidence": 1, "ec_dist": ec_dist,
+                                "analyze_time_s": round(analyze_dur, 2),
+                                "evidence": [{
+                                    "ec_class": "EC2", "target_section": "R",
+                                    "confidence": 0.9,
+                                    "reasoning": synthetic_ev.reasoning,
+                                    "suggested_edit": synthetic_ev.suggested_edit,
+                                    "failed_trace_summary": synthetic_ev.failed_trace_summary[:200],
+                                    "trace_id": "synthetic-no-traces",
+                                }],
+                            })
+                        # Detect zero-tool-call batches — infrastructure problem, not knowledge gap
+                        elif all(
+                            t.get("tool_call_count", t.get("n_tool_calls", 0)) == 0
+                            for t in trace_set.failed
+                        ) and trace_set.failed and not trace_set.succeeded:
+                            state.log(f"[ANALYZE] ZERO-TOOL BATCH DETECTED: All {len(trace_set.failed)} tasks failed with 0 tool calls.")
+                            state.log(f"[ANALYZE] This is an infrastructure/topology problem, not a knowledge gap.")
+                            state.log(f"[ANALYZE] Generating targeted EC2 evidence to simplify topology.")
+                            from abstral.config import EvidenceClass, TraceEvidence, EC_SECTION_MAP
+                            synthetic_ev = TraceEvidence(
+                                ec_class=EvidenceClass.EC2,
+                                trace_id="synthetic-zero-tools",
+                                failed_trace_summary=(
+                                    f"All {len(trace_set.failed)} tasks failed with 0 tool calls. "
+                                    f"The {family_name} topology with {len(spec.roles)} agents is preventing "
+                                    f"tool-calling agents from executing. Agents are stuck in routing/analysis "
+                                    f"loops without ever calling tools like login_user or other domain functions."
+                                ),
+                                succeeded_trace_summary="",
+                                reasoning=(
+                                    f"CRITICAL: Zero tool calls across all tasks means the multi-agent graph "
+                                    f"is broken — agents route messages between each other but never call tools. "
+                                    f"This is a TOPOLOGY problem (R section), not a knowledge problem (K section). "
+                                    f"The {family_name} topology with {len(spec.roles)} agents creates too many "
+                                    f"routing hops before a tool-calling agent gets to act. "
+                                    f"SOLUTION: Simplify to a pipeline (Router→Executor) or single agent topology. "
+                                    f"Reduce to 2-3 agents maximum. Ensure the entry point is a tool-calling agent "
+                                    f"or routes to one within 1 hop."
+                                ),
+                                suggested_edit=(
+                                    f"REPLACE the current topology reasoning with: "
+                                    f"'Use a simple pipeline topology with 2 agents: a Router (non-tool) that "
+                                    f"analyzes the request in 1 sentence, then routes to an Executor (tool-calling) "
+                                    f"that performs all tool calls. The Executor should be the primary agent. "
+                                    f"Do NOT use debate, deep hierarchical, or ensemble topologies — they cause "
+                                    f"routing loops that prevent tool execution.'"
+                                ),
+                                target_section=EC_SECTION_MAP[EvidenceClass.EC2],
+                                confidence=0.95,
+                            )
+                            ec_dist = {"EC1": 0, "EC2": 1, "EC3": 0, "EC4": 0, "EC5": 0}
+
+                            class _ZeroToolAnalysis:
+                                evidence = [synthetic_ev]
+                                ec_distribution = ec_dist
+                                summary = "Zero-tool batch: topology prevents tool execution"
+                            analysis = _ZeroToolAnalysis()
+
+                            analyze_dur = time.time() - analyze_start
+                            phase_timings["analyze"] = round(analyze_dur, 2)
+                            state.log(f"[ANALYZE] Complete (zero-tool fast-path) in {analyze_dur:.1f}s")
+                            state.evidence_history.append({
+                                "outer": outer, "inner": inner,
+                                "n_evidence": 1, "ec_dist": ec_dist,
+                                "analyze_time_s": round(analyze_dur, 2),
+                                "evidence": [{
+                                    "ec_class": "EC2", "target_section": "R",
+                                    "confidence": 0.95,
+                                    "reasoning": synthetic_ev.reasoning[:300],
+                                    "suggested_edit": synthetic_ev.suggested_edit[:300],
+                                    "failed_trace_summary": synthetic_ev.failed_trace_summary[:200],
+                                    "trace_id": "synthetic-zero-tools",
+                                }],
+                            })
+
+                        else:
+                            # Normal analysis with real traces
+                            n_pairs = len(analyzer.trace_manager.pair_traces(trace_set)) if hasattr(analyzer, 'trace_manager') else 0
+                            state.log(f"[ANALYZE] Contrastive pairs available: {n_pairs}")
+                            if n_pairs == 0:
+                                if trace_set.failed and not trace_set.succeeded:
+                                    state.log(f"[ANALYZE] Mode: single-trace analysis (all tasks failed)")
+                                elif trace_set.succeeded and not trace_set.failed:
+                                    state.log(f"[ANALYZE] Mode: emergent pattern detection (all tasks succeeded)")
+                                else:
+                                    state.log(f"[ANALYZE] Mode: mixed but no contrastive pairs formed")
+                            else:
+                                state.log(f"[ANALYZE] Mode: contrastive pair analysis")
+
+                            analysis = analyzer.analyze_traces(skill_doc, trace_set)
+                            ec_dist = analysis.ec_distribution
+                            analyze_dur = time.time() - analyze_start
+                            phase_timings["analyze"] = round(analyze_dur, 2)
+                            state.log(f"[ANALYZE] Complete in {analyze_dur:.1f}s")
+                            state.log(f"[ANALYZE]   Evidence items: {len(analysis.evidence)}")
+                            state.log(f"[ANALYZE]   EC distribution: {ec_dist}")
+                            state.log(f"[ANALYZE]   Summary: {analysis.summary}")
+
+                            evidence_details = []
+                            for idx, ev in enumerate(analysis.evidence):
+                                state.log(f"[ANALYZE]   Evidence #{idx+1}:")
+                                state.log(f"[ANALYZE]     EC class: {ev.ec_class.value}")
+                                state.log(f"[ANALYZE]     Target section: {ev.target_section}")
+                                state.log(f"[ANALYZE]     Confidence: {ev.confidence:.2f}")
+                                state.log(f"[ANALYZE]     Reasoning: {ev.reasoning[:250]}")
+                                state.log(f"[ANALYZE]     Suggested edit: {ev.suggested_edit[:250]}")
+                                if ev.failed_trace_summary:
+                                    state.log(f"[ANALYZE]     Failed trace: {ev.failed_trace_summary[:150]}")
+                                if ev.succeeded_trace_summary:
+                                    state.log(f"[ANALYZE]     Succeeded trace: {ev.succeeded_trace_summary[:150]}")
+                                state.log(f"[ANALYZE]     Trace ID: {ev.trace_id}")
+                                evidence_details.append({
+                                    "ec_class": ev.ec_class.value,
+                                    "target_section": ev.target_section,
+                                    "confidence": ev.confidence,
+                                    "reasoning": ev.reasoning,
+                                    "suggested_edit": ev.suggested_edit,
+                                    "failed_trace_summary": ev.failed_trace_summary[:200] if ev.failed_trace_summary else "",
+                                    "trace_id": ev.trace_id,
+                                })
+                            state.evidence_history.append({
+                                "outer": outer, "inner": inner,
+                                "n_evidence": len(analysis.evidence),
+                                "ec_dist": ec_dist,
+                                "analyze_time_s": round(analyze_dur, 2),
+                                "evidence": evidence_details,
+                            })
+                    except Exception as e:
+                        analyze_dur = time.time() - analyze_start
+                        phase_timings["analyze"] = round(analyze_dur, 2)
+                        state.log(f"[ANALYZE] FAILED after {analyze_dur:.1f}s: {e}")
+                        state.log(f"[ANALYZE] Full traceback: {traceback.format_exc()}")
+                        ec_dist = {"EC1": 0, "EC2": 0, "EC3": 0, "EC4": 0, "EC5": 0}
+
+                        class _EmptyAnalysis:
+                            evidence = []
+                            ec_distribution = ec_dist
+                            summary = "Analysis failed"
+                        analysis = _EmptyAnalysis()
+                        state.evidence_history.append({
+                            "outer": outer, "inner": inner,
+                            "n_evidence": 0, "ec_dist": ec_dist,
+                            "analyze_time_s": round(analyze_dur, 2),
+                            "evidence": [], "error": str(e),
+                        })
+
+                    state.ec_history.append({"outer": outer, "inner": inner, "ec_dist": ec_dist})
 
                 # ── UPDATE ──
                 state.current_phase = f"O{outer} I{inner}: UPDATE"
