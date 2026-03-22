@@ -38,7 +38,7 @@ class SOPEnvManager:
         self,
         domain: str = "bank",
         mode: str = "prompt",  # "prompt" (agent verifies constraints) or "program" (oracle enforces)
-        default_constraint_option: str = "all",
+        default_constraint_option: str = "full",
         constraint_descr_format: str = "structured",
     ):
         self.domain = domain
@@ -64,7 +64,8 @@ class SOPEnvManager:
         # Pre-compute default dependencies
         from env.task import task_default_dep_full
         self.dep_innate_full, self.default_dep_full, self.default_dep_full_descr = \
-            task_default_dep_full(domain, default_constraint_option, constraint_descr_format)
+            task_default_dep_full(domain, default_constraint_option, constraint_descr_format,
+                                 dependency_verb_dep_orig=True)
 
     def create_env(self, task_index: int):
         """Create a SOPBench environment for a specific task.

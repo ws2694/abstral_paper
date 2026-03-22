@@ -265,17 +265,18 @@ def run_pipeline(
             state.log("=" * 80)
 
             if outer == 1:
+                initial_family = getattr(config, "seed_family_override", None) or "hierarchical"
                 if is_tau:
                     seed_doc = SkillDocument.create_tau_bench_seed(
-                        config.tau_bench.domain, "hierarchical", tau_wiki
+                        config.tau_bench.domain, initial_family, tau_wiki
                     )
                 elif is_sop:
                     seed_doc = SkillDocument.create_sop_bench_seed(
-                        config.sop_bench.domain, "hierarchical", sop_system_prompt
+                        config.sop_bench.domain, initial_family, sop_system_prompt
                     )
                 else:
-                    seed_doc = SkillDocument.create_seed(benchmark, "hierarchical")
-                seed_topology = seed_doc.metadata.get("topology_family", "hierarchical")
+                    seed_doc = SkillDocument.create_seed(benchmark, initial_family)
+                seed_topology = seed_doc.metadata.get("topology_family", initial_family)
                 state.current_phase = f"Outer {outer}: Seeding {seed_topology}"
                 state.log(f"[SEED] Initial seed topology: {seed_topology}")
                 state.log(f"[SEED] Seed K section: {len(seed_doc.K.split())} words")

@@ -226,6 +226,244 @@ def run_sop_fixed_topology(output_dir: Path, domain: str = "bank"):
     return run_benchmark(f"sop_{domain}", config, output_dir, label="fixed_topology")
 
 
+def run_sop_test_eval(output_dir: Path, domain: str = "bank", source_experiment: str = "main"):
+    """Evaluate best topology from a completed experiment on held-out test set.
+
+    Loads the best AgentSpec + SKILL.md from the source experiment,
+    rebuilds the graph via BUILD phase, and evaluates on the test split
+    (94 tasks for bank, never seen during val-based inner loop).
+    """
+    benchmark = f"sop_{domain}"
+    source_name = f"{source_experiment}_{benchmark}"
+    results_path = output_dir / f"{source_name}.json"
+
+    if not results_path.exists():
+        print(f"ERROR: No results found at {results_path}")
+        print(f"Run --main first, then --test to evaluate on held-out set.")
+        sys.exit(1)
+
+    with open(results_path) as f:
+        data = json.load(f)
+
+    # Find best iteration
+    if not data.get("auc_history"):
+        print("ERROR: No AUC history in results.")
+        sys.exit(1)
+
+    best_entry = max(data["auc_history"], key=lambda h: h["auc"])
+    best_outer = best_entry["outer"]
+    best_inner = best_entry["inner"]
+    best_auc = best_entry["auc"]
+    best_family = best_entry["family"]
+
+    print("\n" + "="*80)
+    print(f"  HELD-OUT TEST EVALUATION — SOPBench {domain}")
+    print(f"  Source: {source_name} (best val AUC: {best_auc:.4f} at O{best_outer}/I{best_inner})")
+    print(f"  Topology: {best_family}")
+    print(f"  Test set: {134-40 if domain == 'bank' else 124-40} tasks (never seen during training)")
+    print("="*80)
+
+    # Load SKILL.md from best outer loop
+    artifact_dir = output_dir / "artifacts" / source_name / f"outer_{best_outer}"
+    skill_path = artifact_dir / "SKILL.md"
+    if not skill_path.exists():
+        print(f"ERROR: SKILL.md not found at {skill_path}")
+        sys.exit(1)
+
+    from abstral.skill.document import SkillDocument
+    from abstral.skill.versioning import SkillRepository
+    skill_repo = SkillRepository(artifact_dir)
+    skill_doc = skill_repo.read()
+
+    # Checkout the SKILL.md at the best inner iteration
+    import subprocess
+    try:
+        # Git log to find the right commit
+        result = subprocess.run(
+            ["git", "log", "--oneline", f"--grep=iter-{best_inner}:"],
+            capture_output=True, text=True, cwd=str(artifact_dir)
+        )
+        commits = result.stdout.strip().split("\n")
+        if commits and commits[0]:
+            best_commit = commits[0].split()[0]
+            subprocess.run(["git", "checkout", best_commit, "--", "SKILL.md"],
+                          cwd=str(artifact_dir), capture_output=True)
+            skill_doc = skill_repo.read()
+            print(f"  Loaded SKILL.md from commit {best_commit} (iter-{best_inner})")
+            # Restore HEAD
+            subprocess.run(["git", "checkout", "HEAD", "--", "SKILL.md"],
+                          cwd=str(artifact_dir), capture_output=True)
+        else:
+            print(f"  WARNING: Could not find commit for iter-{best_inner}, using latest SKILL.md")
+    except Exception as e:
+        print(f"  WARNING: Git checkout failed ({e}), using latest SKILL.md")
+
+    print(f"  SKILL.md: {skill_doc.word_count()} words, {skill_doc.rule_count()} rules")
+
+    # Determine turn limit — check if this is a "fair" run
+    fair_mode = source_experiment.startswith("fair_")
+
+    # Configure for test evaluation
+    config = ABSTRALConfig()
+    config.agent_backbone.model = "gpt-4o"
+    config.outer_loop.n_outer = 1
+    config.inner_loop.max_iterations = 1
+    config.inner_loop.val_batch_size = 200  # All test tasks
+    config.inner_loop.token_budget = 500000
+    config.inner_loop.wall_clock_limit_sec = 300
+    config.sop_bench.domain = domain
+    if fair_mode:
+        config.sop_bench.max_turns = 60
+
+    # Run BUILD phase to reconstruct graph from SKILL.md
+    from abstral.layer1.builder import AgentBuilder
+    builder = AgentBuilder(config)
+
+    # Get task description for BUILD
+    if domain == "bank":
+        task_desc = (
+            "Design a multi-agent system for banking customer service. "
+            "Agents must handle authentication, account operations, transactions, "
+            "and credit/loan services following strict banking compliance rules."
+        )
+    else:
+        task_desc = (
+            "Design a multi-agent system for healthcare service operations."
+        )
+
+    print(f"  Running BUILD phase to reconstruct graph...")
+    spec = builder.design_agent_spec(skill_doc, task_desc)
+    print(f"  Built: {spec.topology_family.value} with {len(spec.roles)} roles, {len(spec.edges)} edges")
+
+    # Build and compile graph
+    from abstral.sop_adapter import SOPEnvManager, wrap_sop_tools
+    sop_manager = SOPEnvManager(domain=domain)
+    _ref_sys, _ref_user, _ref_asst, _ref_info, _ = sop_manager.create_env(0)
+    sop_tool_provider = lambda: wrap_sop_tools(_ref_sys, _ref_asst)
+
+    compiled, meta = builder.build_graph(
+        spec, task_desc,
+        tool_provider=sop_tool_provider,
+        benchmark_mode="tau",
+        domain_knowledge=skill_doc.K,
+    )
+    print(f"  Graph compiled: {meta.get('n_roles', '?')} nodes")
+
+    # Load TEST split
+    from abstral.layer1.runner import SOPBenchRunner, load_benchmark_tasks
+    runner = SOPBenchRunner(config)
+    test_tasks = load_benchmark_tasks(
+        benchmark=benchmark,
+        split="test",
+        n_instances=200,  # All test tasks
+    )
+    print(f"  Loaded {len(test_tasks)} held-out test tasks")
+
+    # Run evaluation
+    t0 = time.time()
+    run_result = runner.run_batch(compiled, test_tasks, run_tag=f"test_{source_name}")
+    elapsed = time.time() - t0
+
+    test_auc = run_result.success_rate
+    n_passed = run_result.metrics.get("n_succeeded", 0)
+    n_total = run_result.metrics.get("n_tasks", len(test_tasks))
+
+    print(f"\n  {'='*60}")
+    print(f"  TEST SET RESULTS")
+    print(f"  {'='*60}")
+    print(f"  Val AUC (best iteration):  {best_auc:.4f} ({best_family}, O{best_outer}/I{best_inner})")
+    print(f"  Test AUC (held-out):       {test_auc:.4f}")
+    print(f"  Passed: {n_passed}/{n_total}")
+    print(f"  Time: {elapsed:.0f}s")
+    print(f"  Tokens: {run_result.total_tokens}")
+    if fair_mode:
+        print(f"  Turn limit: 60 (fair multi-agent budget)")
+    else:
+        print(f"  Turn limit: 20 (matched published protocol)")
+
+    # Per-task breakdown
+    should_true_pass = 0
+    should_true_total = 0
+    should_false_pass = 0
+    should_false_total = 0
+    for r in run_result.results:
+        ss = r.metadata.get("action_should_succeed", True)
+        if ss:
+            should_true_total += 1
+            if r.success:
+                should_true_pass += 1
+        else:
+            should_false_total += 1
+            if r.success:
+                should_false_pass += 1
+
+    print(f"\n  should_succeed=True:  {should_true_pass}/{should_true_total} ({should_true_pass/max(should_true_total,1):.0%})")
+    print(f"  should_succeed=False: {should_false_pass}/{should_false_total} ({should_false_pass/max(should_false_total,1):.0%})")
+
+    # Save test results
+    test_data = {
+        "experiment": f"test_{source_name}",
+        "source_experiment": source_name,
+        "best_val_auc": best_auc,
+        "best_outer": best_outer,
+        "best_inner": best_inner,
+        "best_family": best_family,
+        "test_auc": test_auc,
+        "n_passed": n_passed,
+        "n_total": n_total,
+        "should_true_pass": should_true_pass,
+        "should_true_total": should_true_total,
+        "should_false_pass": should_false_pass,
+        "should_false_total": should_false_total,
+        "elapsed_s": elapsed,
+        "tokens": run_result.total_tokens,
+        "fair_mode": fair_mode,
+        "turn_limit": 60 if fair_mode else 20,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "per_task": [
+            {
+                "task_id": r.task_id,
+                "passed": r.success,
+                "turns": r.metadata.get("turns_used", 0),
+                "tools": r.metadata.get("tools_called", 0),
+                "goal": r.metadata.get("user_goal", ""),
+                "should_succeed": r.metadata.get("action_should_succeed", True),
+            }
+            for r in run_result.results
+        ],
+    }
+    test_path = output_dir / f"test_{source_name}.json"
+    with open(test_path, "w") as f:
+        json.dump(test_data, f, indent=2, default=str)
+    print(f"\n  Results saved to {test_path}")
+
+
+def run_sop_fair_main(output_dir: Path, domain: str = "bank"):
+    """ABSTRAL with fair multi-agent turn budget (max_turns=60).
+
+    Same tool call limit (10) as published baseline, but increased turn
+    budget to compensate for multi-agent routing overhead.
+    Single-agent baselines use ~100% turn efficiency (every turn = tool call).
+    Multi-agent systems average ~26% efficiency, so 60 turns ≈ 15 effective actions.
+    """
+    print("\n" + "="*80)
+    print(f"  FAIR MAIN EXPERIMENT — SOPBench {domain} (3 outer × 8 inner, max_turns=60)")
+    print(f"  Same tool budget (10 calls), fair turn budget for multi-agent routing")
+    print("="*80)
+
+    config = ABSTRALConfig()
+    config.agent_backbone.model = "gpt-4o"
+    config.outer_loop.n_outer = 3
+    config.inner_loop.max_iterations = 8
+    config.inner_loop.val_batch_size = 20
+    config.inner_loop.token_budget = 200000
+    config.inner_loop.wall_clock_limit_sec = 300
+    config.sop_bench.domain = domain
+    config.sop_bench.max_turns = 60  # Fair budget for multi-agent
+
+    return run_benchmark(f"sop_{domain}", config, output_dir, label="fair_main")
+
+
 def format_sop_tables(output_dir: Path, domain: str = "bank"):
     """Print SOPBench results summary."""
     print("\n" + "="*80)
@@ -233,7 +471,8 @@ def format_sop_tables(output_dir: Path, domain: str = "bank"):
     print("="*80)
 
     experiments = [
-        (f"main_sop_{domain}", "ABSTRAL (full)"),
+        (f"main_sop_{domain}", "ABSTRAL (full, 20 turns)"),
+        (f"fair_main_sop_{domain}", "ABSTRAL (full, 60 turns)"),
         (f"inner_only_sop_{domain}", "ABSTRAL (inner-only)"),
         (f"single_agent_sop_{domain}", "Single Agent (GPT-4o)"),
         (f"fixed_topology_sop_{domain}", "Fixed Topology"),
@@ -256,6 +495,23 @@ def format_sop_tables(output_dir: Path, domain: str = "bank"):
             print(f"{label:<30} {best['auc']:>10.4f} {best['family']:>18} {n_iters:>8} {tokens:>10}")
         else:
             print(f"{label:<30} {'(no data)':>10}")
+
+    # Test set results
+    test_experiments = [
+        (f"test_main_sop_{domain}", "ABSTRAL (test, 20 turns)"),
+        (f"test_fair_main_sop_{domain}", "ABSTRAL (test, 60 turns)"),
+    ]
+    has_test = False
+    for filename, label in test_experiments:
+        path = output_dir / f"{filename}.json"
+        if path.exists():
+            if not has_test:
+                print(f"\n{'Held-out Test Results':<30} {'Test AUC':>10} {'Val AUC':>10} {'Tasks':>8}")
+                print("-" * 62)
+                has_test = True
+            with open(path) as f:
+                td = json.load(f)
+            print(f"{label:<30} {td['test_auc']:>10.4f} {td['best_val_auc']:>10.4f} {td['n_total']:>8}")
 
     # Published baselines
     print(f"\n  Published Baselines (Li et al., 2025, FC mode):")
@@ -293,6 +549,10 @@ def main():
     parser.add_argument("--main", action="store_true", help="Full ABSTRAL experiment")
     parser.add_argument("--ablation", action="store_true", help="Inner-only + fixed topology ablations")
     parser.add_argument("--all", action="store_true", help="Run everything: baseline + main + ablations")
+    parser.add_argument("--fair", action="store_true", help="Fair turn budget experiment (max_turns=60)")
+    parser.add_argument("--test", action="store_true", help="Evaluate best topology on held-out test set")
+    parser.add_argument("--test-source", type=str, default="main",
+                        help="Source experiment for --test (default: main, use fair_main for fair)")
     parser.add_argument("--tables", action="store_true", help="Print results summary")
     parser.add_argument("--output-dir", type=str, default=str(RESULTS_DIR))
     args = parser.parse_args()
@@ -337,6 +597,14 @@ def main():
 
     if args.main:
         run_sop_main(output_dir, domain=args.domain)
+        return
+
+    if args.fair:
+        run_sop_fair_main(output_dir, domain=args.domain)
+        return
+
+    if args.test:
+        run_sop_test_eval(output_dir, domain=args.domain, source_experiment=args.test_source)
         return
 
     if args.ablation:

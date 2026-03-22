@@ -339,9 +339,9 @@ class SOPBenchBankLoader(BenchmarkLoader):
         from abstral.sop_adapter import SOPEnvManager
 
         manager = SOPEnvManager(domain="bank")
-        tasks = []
+        all_tasks = []
         for i, task_data in enumerate(manager.tasks):
-            tasks.append(TaskInstance(
+            all_tasks.append(TaskInstance(
                 id=f"sop_bank_{i}",
                 input_text=task_data.get("user_prompt", task_data.get("user_instruction", "")),
                 expected_output="",  # Scoring via oracle verifier
@@ -355,6 +355,21 @@ class SOPBenchBankLoader(BenchmarkLoader):
                     "action_should_succeed": task_data.get("action_should_succeed", True),
                 },
             ))
+
+        # Train/test split: first 40 tasks (seed=42 shuffle) = val, rest = test
+        if split in ("val", "test"):
+            rng = random.Random(42)  # Fixed seed for reproducible split
+            indices = list(range(len(all_tasks)))
+            rng.shuffle(indices)
+            val_indices = set(indices[:40])
+            if split == "val":
+                tasks = [all_tasks[i] for i in indices[:40]]
+                logger.info(f"SOPBench bank val split: {len(tasks)} tasks")
+            else:  # test
+                tasks = [all_tasks[i] for i in indices[40:]]
+                logger.info(f"SOPBench bank test split: {len(tasks)} tasks")
+        else:
+            tasks = all_tasks
 
         if n_instances and n_instances < len(tasks):
             rng = random.Random(seed)

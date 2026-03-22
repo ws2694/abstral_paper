@@ -272,21 +272,11 @@ class SkillDocument:
             ),
             K=(
                 f"## Domain Knowledge — {domain.title()} Service\n\n"
-                f"The following describes the agent's role and operating procedures:\n\n"
                 f"{system_prompt}\n\n"
-                f"## EXECUTION GUIDELINES\n\n"
-                f"Follow the constraint rules in the 'Actions with Constraints' section above. "
-                f"Each action lists its specific prerequisites. Only perform the checks listed "
-                f"for that action — do NOT add extra steps.\n\n"
-                f"General workflow:\n"
-                f"1. **READ CONSTRAINTS**: Check what the target action requires (listed above).\n"
-                f"2. **VERIFY PREREQUISITES**: Use internal_check_* tools ONLY for the constraints listed.\n"
-                f"   - `login_user` is ONLY required when the constraint says 'logged in previously'.\n"
-                f"   - Many actions (deposit_funds, apply_credit_card, etc.) do NOT require login.\n"
-                f"3. **EXECUTE ACTION**: Call the target tool with the correct parameters from the user's request.\n"
-                f"4. **EXIT**: Call `exit_conversation` when done.\n\n"
-                f"CRITICAL: You MUST actually call tools. Do NOT just talk about what you would do. "
-                f"Every turn should include a tool call until the task is complete."
+                f"## Operating Notes\n\n"
+                f"- You MUST call tools to complete tasks. Do not just describe what you would do.\n"
+                f"- Follow the constraint rules listed above for each action.\n"
+                f"- Call `exit_conversation` when the task is complete or cannot be fulfilled."
             ),
             R=(
                 f"Default topology reasoning for {topology_family} architecture.\n\n"
@@ -300,14 +290,11 @@ class SkillDocument:
             T="No agent templates defined yet. Templates will emerge from trace analysis.",
             P=(
                 f"### Construction Protocol for SOPBench {domain.title()} Tasks\n\n"
-                f"1. Read the action's specific constraints before doing anything.\n"
-                f"2. Only call login_user if the action's constraints explicitly require the user to be 'logged in previously'.\n"
-                f"3. Use internal_check_* tools only for the constraints listed for that action.\n"
-                f"4. Only ONE tool call at a time.\n"
-                f"5. If a constraint check fails, decline the action and explain why.\n"
-                f"6. Call exit_conversation when the request is completed or cannot be fulfilled.\n"
-                f"7. NEVER respond with text-only. Every turn MUST include a tool call until done.\n"
-                f"8. Prefer FEWER agents (2-3). More agents = more routing overhead = fewer tool calls."
+                f"1. Follow the constraint rules in the system prompt exactly.\n"
+                f"2. Only ONE tool call at a time.\n"
+                f"3. If a constraint check fails, decline the action and explain why.\n"
+                f"4. Call exit_conversation when the request is completed or cannot be fulfilled.\n"
+                f"5. Prefer FEWER agents (2-3). More agents = more routing overhead = fewer tool calls."
             ),
             metadata={
                 "version": "0",

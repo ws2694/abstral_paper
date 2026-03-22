@@ -707,7 +707,7 @@ class SOPBenchRunner(AgentRunner):
     """
 
     HISTORY_WINDOW = 20
-    MAX_TOOL_CALLS = 15  # Max total tool calls per task
+    MAX_TOOL_CALLS = 10  # Match SOPBench default (run_simulation.py --max_num_actions=10)
 
     def __init__(self, config: ABSTRALConfig):
         super().__init__(config)
@@ -751,18 +751,9 @@ class SOPBenchRunner(AgentRunner):
             total_tokens = 0
             done = False
 
-            # Inject SOPBench assistant instructions (constraint rules) as
-            # system context. This contains task-specific dependency rules
-            # that the agent MUST follow for dirgraph_satisfied to pass.
-            sop_instructions = assistant_info.get("instructions", "")
-            if sop_instructions:
-                from langchain_core.messages import SystemMessage
-                conversation_history.append(SystemMessage(
-                    content=f"### SOPBench Operating Instructions ###\n\n{sop_instructions}\n\n"
-                    f"IMPORTANT: You must call tools to complete this task. "
-                    f"Follow the constraint rules above exactly. "
-                    f"Call exit_conversation when done."
-                ))
+            # NOTE: System prompt is already in the agent's prompt via SKILL.md
+            # K section. Do NOT inject it again here — published baselines only
+            # see it once, so double-injection would be an unfair advantage.
 
             # Initial user message — use task["user_prompt"] which is the
             # natural language customer request with real data embedded
@@ -902,7 +893,13 @@ class SOPBenchRunner(AgentRunner):
 
                 if last_ai_msg is None:
                     logger.warning(f"Task {task.id} turn {turn}: no AI message produced")
-                    break
+                    # Inject a nudge to break the cycle — the graph terminated
+                    # without producing an AIMessage (likely visit cap hit).
+                    # Add a user prompt to give agents fresh context.
+                    conversation_history.append(
+                        HumanMessage(content="Please proceed with the customer's request. Use the available tools to complete the task.")
+                    )
+                    continue
 
                 if last_ai_msg.tool_calls:
                     # Limit to first tool call (SOPBench expects sequential calls)

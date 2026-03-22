@@ -121,7 +121,7 @@ class TauBenchConfig(BaseModel):
 class SOPBenchConfig(BaseModel):
     domain: str = "bank"
     mode: str = "prompt"  # "prompt" (agent verifies) or "program" (oracle enforces)
-    max_turns: int = 25
+    max_turns: int = 20  # Match SOPBench default (run_simulation.py --max_num_turns=20)
 
 
 class ABSTRALConfig(BaseModel):
@@ -135,6 +135,7 @@ class ABSTRALConfig(BaseModel):
     paths: PathsConfig = Field(default_factory=PathsConfig)
     tau_bench: TauBenchConfig = Field(default_factory=TauBenchConfig)
     sop_bench: SOPBenchConfig = Field(default_factory=SOPBenchConfig)
+    seed_family_override: str | None = None  # Override initial seed topology family
 
     @classmethod
     def from_yaml(cls, path: "str | Path") -> "ABSTRALConfig":

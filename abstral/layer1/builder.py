@@ -335,12 +335,14 @@ class AgentBuilder:
             if state.get("iteration_count", 0) >= max_steps:
                 return "__end__"
 
-            # Per-node visit tracking: terminate if any agent visited > 2x
+            # Per-node visit tracking: terminate if any agent visited too many times
+            # Complex topologies (>4 targets) need more routing hops
+            max_visits = 3 if len(targets) > 4 else 2
             visit_counts = state.get("_visit_counts", {})
             current_agent = state.get("current_agent", "")
             if current_agent:
                 count = visit_counts.get(current_agent, 0)
-                if count >= 2:
+                if count >= max_visits:
                     return "__end__"
 
             # Priority 1: Explicit route_to field from non-tool agent
