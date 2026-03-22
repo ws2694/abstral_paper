@@ -128,27 +128,15 @@ python run_sop.py --domain bank --ablation
 # (included in --ablation above)
 ```
 
-### 6. Fair turn-budget experiment
-
-Multi-agent systems incur routing overhead (~26% turn efficiency vs ~100% for single-agent). This variant raises the turn limit from 20 → 60 while keeping the same tool-call budget (10 calls).
-
-```bash
-python run_sop.py --domain bank --fair
-```
-
-### 7. Held-out test evaluation
+### 6. Held-out test evaluation
 
 After the main experiment finishes, evaluate the best topology on the held-out test split (tasks never seen during the inner loop).
 
 ```bash
-# Evaluate best topology from --main (20-turn limit)
 python run_sop.py --domain bank --test
-
-# Evaluate best topology from --fair (60-turn limit)
-python run_sop.py --domain bank --test --test-source fair_main
 ```
 
-### 8. View results
+### 7. View results
 
 ```bash
 # Print comparison table (val AUC, topology family, published baselines)
@@ -172,7 +160,6 @@ python run_sop.py --domain healthcare --all
 | `--smoke` | < $0.50 | ~2 min |
 | `--baseline` | $5–10 | ~20 min |
 | `--main` | $70–100 | 2–4 hrs |
-| `--fair` | $70–100 | 2–4 hrs |
 | `--ablation` | $30–50 | 1–2 hrs |
 | `--test` | $5–10 | ~20 min |
 
@@ -181,12 +168,10 @@ python run_sop.py --domain healthcare --all
 ```
 results/sop/
 ├── main_sop_bank.json                # Full experiment (val)
-├── fair_main_sop_bank.json           # Fair turn-budget experiment
 ├── single_agent_sop_bank.json        # Single-agent baseline
 ├── inner_only_sop_bank.json          # Inner-only ablation
 ├── fixed_topology_sop_bank.json      # Fixed topology ablation
 ├── test_main_sop_bank.json           # Held-out test evaluation
-├── test_fair_main_sop_bank.json      # Fair test evaluation
 ├── smoke_sop_bank.json               # Smoke test
 ├── artifacts/                        # Converged SKILL.md per outer loop
 │   └── main_sop_bank/outer_{1,2,3}/SKILL.md
